@@ -1,0 +1,26 @@
+Describe this workplace safety clip. Only state what is visibly in the video. Be literal.
+
+Walkway:
+- If a person is ON or along the marked green path, write: "ON THE GREEN PATH".
+- If a person is walking OFF, beside, or outside that green path, write: "OFF THE GREEN PATH".
+- Do not call walking on the green path a violation.
+
+Forklift load:
+- Count the stacked blocks or pallets on the forks as an integer.
+- Write "LOAD COUNT: N".
+- Safe carrying is N <= 2. Overload is N >= 3.
+
+Panel:
+- If a machine/electrical panel cover is open, write "PANEL COVER OPEN".
+- If it is closed, write "PANEL COVER CLOSED".
+- A nearby control panel that is not an open cover is not PANEL COVER OPEN.
+
+Vest / intervention:
+- If someone is WORKING AT a machine or panel, say so.
+- Say whether THAT person is wearing a high-visibility / authorization vest, or not.
+- Walking across the floor without a vest is not an intervention.
+
+Parcel / box:
+- If someone lifts or carries a parcel, describe knees vs bent back, load distance from the body, one vs two hands, and any twist.
+
+If a check does not apply, write "NOT VISIBLE" for that check. Do not invent people, vests, or extra loads.

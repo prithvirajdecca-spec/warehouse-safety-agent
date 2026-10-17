@@ -37,42 +37,56 @@ WANDB_PROJECT = os.environ.get("WANDB_PROJECT") or ""
 WANDB_MODEL = os.environ.get("WANDB_MODEL") or "meta-llama/Llama-3.1-8B-Instruct"
 USE_SAMPLE = os.environ.get("USE_SAMPLE", "").lower() in ("1", "true", "yes")
 
-CLASSES = [
-    ("walkway_violation", "Walkway violation", "unsafe", "high",
-     "Stop and coach: return to the marked green path",
-     ("off the green", "outside the green", "walkway violation", "not on the marked", "leaving the green")),
-    ("unauthorized_intervention", "Unauthorized intervention", "unsafe", "high",
-     "Stop work until a high-vis authorized vest is worn",
-     ("without a vest", "no vest", "unauthorized", "not wearing")),
-    ("opened_panel_cover", "Opened panel cover", "unsafe", "high",
-     "Close the panel cover before leaving the machine",
-     ("panel cover open", "opened panel", "cover is open", "door open")),
-    ("forklift_overload", "Forklift overload", "unsafe", "high",
-     "Stop forklift until the load is 2 blocks or fewer",
-     ("three", "3+", "overload", "more than two", "four stacked")),
-    ("parcel_handling", "Parcel handling", "unsafe", "medium",
-     "Coach: bend knees, keep the load close, two-handed grip",
-     ("parcel", "cardboard box", "carrying a box", "lifting a box", "stoop", "bent back")),
-    ("safe_walkway", "Safe walkway", "safe", "low",
-     "No action — worker is on the marked green path",
-     ("along the green", "on the marked green", "staying on the green")),
-    ("authorized_intervention", "Authorized intervention", "safe", "low",
-     "No action — authorized vest visible",
-     ("high-vis", "high vis", "authorization vest", "green vest")),
-    ("closed_panel_cover", "Closed panel cover", "safe", "low",
-     "No action — panel cover closed",
-     ("cover closed", "closed panel", "panel is closed")),
-    ("safe_carrying", "Safe carrying", "safe", "low",
-     "No action — forklift load is 2 or fewer",
-     ("two stacked", "two blocks", "two pallets", "carrying two")),
-]
+CLASS_META = {
+    "walkway_violation": ("Walkway violation", "unsafe", "high",
+                          "Stop and coach: return to the marked green path"),
+    "unauthorized_intervention": ("Unauthorized intervention", "unsafe", "high",
+                                  "Stop work until a high-vis authorized vest is worn"),
+    "opened_panel_cover": ("Opened panel cover", "unsafe", "high",
+                           "Close the panel cover before leaving the machine"),
+    "forklift_overload": ("Forklift overload", "unsafe", "high",
+                          "Stop forklift until the load is 2 blocks or fewer"),
+    "parcel_handling": ("Parcel handling", "unsafe", "medium",
+                        "Coach: bend knees, keep the load close, two-handed grip"),
+    "safe_walkway": ("Safe walkway", "safe", "low",
+                     "No action — worker is on the marked green path"),
+    "authorized_intervention": ("Authorized intervention", "safe", "low",
+                                "No action — authorized vest visible"),
+    "closed_panel_cover": ("Closed panel cover", "safe", "low",
+                           "No action — panel cover closed"),
+    "safe_carrying": ("Safe carrying", "safe", "low",
+                      "No action — forklift load is 2 or fewer"),
+}
+
+WAND_B_CLASSIFY_PROMPT = """You classify ONE workplace video caption into exactly one class_id.
+Reply JSON only: {"class_id":"...","confidence":0-1}
+
+Definitions (follow these, not the class name sound-alikes):
+- walkway_violation: person is OFF / outside / not on the marked green path.
+- safe_walkway: person is ON or along the marked green path.
+- forklift_overload: forklift load count is 3 or more blocks/pallets.
+- safe_carrying: forklift load count is 1 or 2, or caption says within the safe limit.
+- opened_panel_cover: a machine/electrical PANEL COVER is explicitly OPEN.
+- closed_panel_cover: panel cover is explicitly CLOSED and that is the main fact.
+- unauthorized_intervention: someone WORKING AT a machine/panel WITHOUT a high-vis vest.
+  Walking or sitting in frame without a vest is NOT this class.
+- authorized_intervention: someone working at a machine/panel WITH a high-vis vest.
+- parcel_handling: person lifting or carrying a parcel/box by hand.
+
+Hard rules:
+- If the caption says ON/along the green path, never output walkway_violation.
+- If it says two / two stacked / single load / within the safe limit, never output forklift_overload.
+- If it says three or more stacked loads, prefer forklift_overload over vest/walkway.
+- If PANEL COVER is OPEN, prefer opened_panel_cover over walkway.
+- If multiple apply, pick the most severe unsafe class that is explicitly stated.
+"""
 
 SEARCHES = [
-    ("person walking off the marked green walkway", {"location": "eskisehir_plant"}),
-    ("opened electrical panel cover", {"location": "eskisehir_plant"}),
-    ("worker without a safety vest at a machine panel", {"location": "eskisehir_plant"}),
-    ("forklift carrying three or more blocks", {"location": "eskisehir_plant"}),
-    ("forklift carrying two blocks on the green path", {"location": "eskisehir_plant"}),
+    ("OFF THE GREEN PATH person walking outside the marked walkway", {"location": "eskisehir_plant"}),
+    ("PANEL COVER OPEN on a machine", {"location": "eskisehir_plant"}),
+    ("worker at a machine panel not wearing a high-visibility vest", {"location": "eskisehir_plant"}),
+    ("forklift LOAD COUNT 3 or more stacked blocks overload", {"location": "eskisehir_plant"}),
+    ("forklift LOAD COUNT 2 stacked blocks on the green path", {"location": "eskisehir_plant"}),
     ("person carrying or lifting a parcel", {"location": "parcel_demo"}),
 ]
 
@@ -103,35 +117,92 @@ def _headers() -> dict:
     return {"Authorization": f"Bearer {_login()}"}
 
 
+def _pack(cid: str, conf: float) -> tuple[str, str, str, str, str, float, bool]:
+    label, btype, sev, action = CLASS_META[cid]
+    return cid, label, btype, sev, action, conf, True
+
+
 def classify_rules(caption: str, location: str, tags) -> tuple[str, str, str, str, str, float, bool]:
     text = (caption or "").lower()
     tagset = {str(t).lower() for t in (tags or [])}
     if location == "parcel_demo" or "parcel" in tagset or "manual_handling" in tagset:
-        cid, label, btype, sev, action, _ = next(c for c in CLASSES if c[0] == "parcel_handling")
-        return cid, label, btype, sev, action, 0.7, True
-    for cid, label, btype, sev, action, keys in CLASSES:
-        if cid in tagset:
-            return cid, label, btype, sev, action, 0.8, True
-        if any(k in text for k in keys):
-            return cid, label, btype, sev, action, 0.62, True
-    return "walkway_violation", "Walkway violation", "unsafe", "medium", "Review clip", 0.35, False
+        return _pack("parcel_handling", 0.78)
+
+    three_plus = bool(re.search(
+        r"\b(three|four|five|[3-9])\b.{0,40}\b(block|pallet|load|container)s?\b"
+        r"|exceeds the safe|more than two",
+        text,
+    ))
+    two_or_fewer = bool(re.search(
+        r"\b(two stacked|two blocks|two orange|two pallets|two containers|"
+        r"single load|one block|carrying two|within the safe)\b",
+        text,
+    ))
+    panel_open = bool(re.search(r"panel cover is open|opened panel|cover is open", text))
+    panel_closed = bool(re.search(
+        r"panel cover is closed|panel cover appears to be closed|cover is closed",
+        text,
+    ))
+    on_path = bool(re.search(
+        r"\b(on the (marked )?green|along (this |the )?(marked )?green|"
+        r"staying within the designated)\b",
+        text,
+    ))
+    off_path = bool(re.search(
+        r"\b(off the (marked )?green|outside the green|not on the marked|"
+        r"leaving the green|walkway violation)\b",
+        text,
+    ))
+    at_machine = bool(re.search(
+        r"\b(seated at a machine|working at a machine|working near a machine|"
+        r"operating (the |equipment|the machine)|at a machine or electrical panel|"
+        r"working at the controls)\b",
+        text,
+    ))
+    no_vest = bool(re.search(
+        r"not wearing a high-visibility|not wearing a high vis|without a (high-)?vis|"
+        r"not wearing an? authorization vest",
+        text,
+    ))
+    has_vest = bool(re.search(
+        r"(?<!not )wearing a high-visibility|(?<!not )wearing a high vis",
+        text,
+    ))
+    forklift = "forklift" in text
+
+    # Most specific unsafe first — never let vest/walkway steal a counted overload.
+    if three_plus and not two_or_fewer:
+        return _pack("forklift_overload", 0.88)
+    if three_plus and ("exceeds" in text or "three" in text):
+        return _pack("forklift_overload", 0.84)
+    if panel_open and not panel_closed:
+        return _pack("opened_panel_cover", 0.82)
+    if forklift and two_or_fewer:
+        return _pack("safe_carrying", 0.86)
+    if at_machine and no_vest and not has_vest:
+        return _pack("unauthorized_intervention", 0.76)
+    if off_path and not on_path:
+        return _pack("walkway_violation", 0.84)
+    if at_machine and has_vest:
+        return _pack("authorized_intervention", 0.8)
+    if panel_closed and at_machine:
+        return _pack("closed_panel_cover", 0.74)
+    if on_path:
+        return _pack("safe_walkway", 0.83)
+    return _pack("safe_walkway", 0.3)
 
 
 def classify_wandb(caption: str) -> dict | None:
     if not WANDB_API_KEY or not caption:
         return None
-    allowed = ", ".join(c[0] for c in CLASSES)
+    allowed = ", ".join(CLASS_META)
     body = {
         "model": WANDB_MODEL,
         "temperature": 0,
         "messages": [
             {
                 "role": "system",
-                "content": (
-                    "Classify one workplace video caption. Reply JSON only: "
-                    '{"class_id":"...","confidence":0-1}. class_id must be one of: '
-                    f"{allowed}."
-                ),
+                "content": WAND_B_CLASSIFY_PROMPT + f" class_id must be one of: {allowed}.",
             },
             {"role": "user", "content": caption[:1200]},
         ],
@@ -156,15 +227,15 @@ def classify_wandb(caption: str) -> dict | None:
             return None
         parsed = json.loads(m.group(0))
         cid = parsed.get("class_id")
-        meta = next((c for c in CLASSES if c[0] == cid), None)
-        if not meta:
+        if cid not in CLASS_META:
             return None
+        label, btype, sev, action = CLASS_META[cid]
         return {
-            "class_id": meta[0],
-            "class_label": meta[1],
-            "behavior_type": meta[2],
-            "severity": meta[3],
-            "action": meta[4],
+            "class_id": cid,
+            "class_label": label,
+            "behavior_type": btype,
+            "severity": sev,
+            "action": action,
             "confidence": float(parsed.get("confidence") or 0.7),
         }
     except Exception:
@@ -178,12 +249,14 @@ def hit_to_event(h: dict, allow_wandb: bool) -> dict:
     cid, label, btype, sev, action, conf, _ = classify_rules(caption, loc, tags)
     wandb_used = False
     w = classify_wandb(caption) if allow_wandb else None
+    # Strong caption rules win; W&B only fills weak / ambiguous cases.
     if w:
-        cid, label, btype, sev, action, conf = (
-            w["class_id"], w["class_label"], w["behavior_type"],
-            w["severity"], w["action"], w["confidence"],
-        )
         wandb_used = True
+        if conf < 0.65:
+            cid, label, btype, sev, action, conf = (
+                w["class_id"], w["class_label"], w["behavior_type"],
+                w["severity"], w["action"], w["confidence"],
+            )
     src = h.get("source") or ""
     return {
         "id": src or f"{loc}-{h.get('filename')}",
@@ -193,7 +266,7 @@ def hit_to_event(h: dict, allow_wandb: bool) -> dict:
         "severity": sev,
         "action": action,
         "confidence": round(conf, 2),
-        "label_from_filename": next((t for t in tags if t in {c[0] for c in CLASSES}), None),
+        "label_from_filename": next((t for t in tags if t in CLASS_META), None),
         "label_match": None,
         "location": loc,
         "camera_id": h.get("camera_id") or "",
