@@ -56,7 +56,9 @@ let period = "7d";
 let classFilter = "unsafe";
 let statusFilter = "any";
 let severityFilter = "any";
+let labelReview = null;
 let selectedId = null;
+let assignmentStore = "file";
 
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({
@@ -123,13 +125,31 @@ function statusLabel(status) {
   return (STATUSES.find((s) => s[0] === status) || ["", status])[1];
 }
 
+function isWalkway(e) {
+  return e.class_id === "walkway_violation" || e.class_id === "safe_walkway" || e.label_from_filename === "walkway_violation";
+}
+
 function matchesIncident(e) {
   if (!inPeriod(e)) return false;
-  if (classFilter === "unsafe" && e.behavior_type !== "unsafe") return false;
-  if (classFilter !== "unsafe" && classFilter !== "all" && e.class_id !== classFilter) return false;
+  if (labelReview && e.label_from_filename !== labelReview) return false;
+  if (classFilter === "walkway_violation" && !isWalkway(e)) return false;
+  else if (classFilter === "unsafe" && e.behavior_type !== "unsafe") return false;
+  else if (classFilter !== "unsafe" && classFilter !== "all" && classFilter !== "walkway_violation" && e.class_id !== classFilter) return false;
   if (statusFilter !== "any" && recOf(e).status !== statusFilter) return false;
   if (severityFilter !== "any" && e.severity !== severityFilter) return false;
   return true;
+}
+
+function batchNote() {
+  const times = events.map((e) => Date.parse(e.flagged_at || "")).filter((t) => !Number.isNaN(t));
+  if (!times.length) return "";
+  const min = new Date(Math.min(...times));
+  const max = new Date(Math.max(...times));
+  const when = min.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  if (min.toDateString() === max.toDateString()) {
+    return `Indexed ${when}. The 24-hour, week, and month filters include this same batch.`;
+  }
+  return `Indexed ${when} – ${max.toLocaleDateString(undefined, { month: "short", day: "numeric" })}.`;
 }
 
 function renderSponsors() {
@@ -170,6 +190,18 @@ function kpi(label, num, hint, status) {
   </button>`;
 }
 
+function labelLine() {
+  const labeled = events.filter((e) => e.label_from_filename && inPeriod(e));
+  const agreed = labeled.filter((e) => e.label_match === true).length;
+  const conflicts = events.filter((e) => e.label_from_filename === "walkway_violation" && e.class_id !== "walkway_violation" && inPeriod(e));
+  const agree = labeled.length ? `Ingest labels agree on ${agreed} of ${labeled.length} labeled clips.` : "";
+  const review = conflicts.length
+    ? `<button type="button" class="btn" data-review="walkway_violation">${conflicts.length} walkway clips: dataset says violation, Cosmos says on the path</button>`
+    : "";
+  if (!agree && !review) return "";
+  return `<p class="muted" style="margin:0.45rem 0 0;display:flex;gap:0.6rem;align-items:center;flex-wrap:wrap">${esc(agree)} ${review}</p>`;
+}
+
 function renderDashboard() {
   const rows = flagged();
   const count = (status) => rows.filter((e) => recOf(e).status === status).length;
@@ -187,7 +219,8 @@ function renderDashboard() {
       ${kpi("Under investigation", count("investigating"), "Owner is reviewing", "investigating")}
       ${kpi("Pending", count("pending"), "Assigned, not started", "pending")}
     </div>
-    <p class="muted" style="margin:0.7rem 0 0">Closed this period: ${count("closed")}. Flagged = needs assignment + pending + under investigation + closed.</p>
+    <p class="muted" style="margin:0.7rem 0 0">Closed this period: ${count("closed")}. Flagged = needs assignment + pending + under investigation + closed. ${esc(batchNote())}</p>
+    ${labelLine()}
     <div class="grid-2">
       <section class="card">
         <h2 class="section-title">By severity</h2>
@@ -234,6 +267,7 @@ function renderIncidents() {
       <button type="button" class="chip ${statusFilter === "any" ? "active" : ""}" data-status="any">Any status</button>
       ${STATUSES.map(([id, label]) => `<button type="button" class="chip ${statusFilter === id ? "active" : ""}" data-status="${id}">${label}</button>`).join("")}
       ${severityFilter !== "any" ? `<button type="button" class="chip active" data-severity-clear="1">Severity: ${esc(severityFilter)} ×</button>` : ""}
+      ${labelReview ? `<button type="button" class="chip active" data-review-clear="1">Dataset walkway label ×</button>` : ""}
     </div>
     <section class="card">
       ${rows.length ? rows.map((e) => {
@@ -301,7 +335,8 @@ function caseMetaHtml(e) {
   return `
     <p class="sev ${esc(e.severity)}">${esc(e.severity)} · ${esc(e.behavior_type)}</p>
     <h2 style="margin:0.2rem 0">${esc(e.class_label)}</h2>
-    <p class="meta">${caseNo(e.id)} · ${esc(e.location)} · ${esc(e.camera_id)} · ${esc(fmtWhen(e.flagged_at))} · conf ${esc(e.confidence ?? "—")} · ${match}</p>
+    <p class="meta">${caseNo(e.id)} · ${esc(e.location)} · ${esc(e.camera_id)} · indexed ${esc(fmtWhen(e.flagged_at))} · conf ${esc(e.confidence ?? "—")} · ${match}</p>
+    <p class="reason"><strong>Why</strong> — ${esc(e.reason || "No reason recorded")}</p>
     <p class="action"><strong>Action</strong> — ${esc(e.action)}</p>
     <p class="caption"><strong>Cosmos</strong> — ${esc(e.caption || "No caption")}</p>
     <form class="form" id="assign-form">
@@ -319,21 +354,64 @@ function openCase(id) {
   drawerEl.hidden = false;
   document.body.classList.add("case-open");
   if (!same) {
-    const src = e.source ? `/clip?source=${encodeURIComponent(e.source)}` : "";
+    const src = e.source ? `clip?source=${encodeURIComponent(e.source)}` : "";
     const video = src
-      ? `<video controls playsinline src="${esc(src)}"></video>`
+      ? `<div class="stage"><video controls playsinline src="${esc(src)}"></video><canvas></canvas></div><p class="meta yolo-note">YOLO boxes follow the clip: person, truck, suitcase.</p>`
       : `<p class="empty novideo">Clip URL is not on this event yet.</p>`;
     drawerEl.setAttribute("data-case-id", id);
     drawerEl.innerHTML = `
       <div class="drawer-top"><strong>${caseNo(e.id)}</strong><button type="button" class="btn" data-close-case>Close</button></div>
       ${video}
       <div class="case-meta">${caseMetaHtml(e)}</div>`;
+    const vid = drawerEl.querySelector("video");
+    if (vid && e.source) attachDetections(vid, e.source);
   } else {
     drawerEl.querySelector(".case-meta").innerHTML = caseMetaHtml(e);
   }
   document.querySelectorAll(".ticket, .row-btn").forEach((el) => {
     el.classList.toggle("selected", el.getAttribute("data-open") === id);
   });
+}
+
+function drawBoxes(video) {
+  const canvas = video.parentElement && video.parentElement.querySelector("canvas");
+  const frames = video._frames || [];
+  if (!canvas || !frames.length) return;
+  const width = video._frameW || video.videoWidth || 1;
+  const height = video._frameH || video.videoHeight || 1;
+  const box = video.getBoundingClientRect();
+  canvas.width = Math.max(1, Math.round(box.width));
+  canvas.height = Math.max(1, Math.round(box.height));
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  let frame = frames[0];
+  for (const f of frames) if (f.t <= video.currentTime + 0.08) frame = f;
+  const sx = canvas.width / width;
+  const sy = canvas.height / height;
+  for (const b of frame.boxes || []) {
+    ctx.strokeStyle = b.label === "person" ? "#0f6e8c" : "#c2410c";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(b.x * sx, b.y * sy, b.w * sx, b.h * sy);
+    ctx.fillStyle = ctx.strokeStyle;
+    ctx.font = "12px sans-serif";
+    ctx.fillText(`${b.label} ${b.conf}`, b.x * sx, Math.max(12, b.y * sy - 3));
+  }
+}
+
+function attachDetections(video, source) {
+  video.addEventListener("timeupdate", () => drawBoxes(video));
+  video.addEventListener("loadeddata", () => drawBoxes(video));
+  fetch(`detections?source=${encodeURIComponent(source)}`)
+    .then((r) => r.json())
+    .then((data) => {
+      video._frames = data.frames || [];
+      video._frameW = data.width;
+      video._frameH = data.height;
+      const note = video.parentElement && video.parentElement.parentElement.querySelector(".yolo-note");
+      if (note) note.textContent = video._frames.length ? "YOLO boxes follow the clip: person, truck, suitcase." : "No YOLO boxes for this clip.";
+      drawBoxes(video);
+    })
+    .catch(() => {});
 }
 
 function closeCase() {
@@ -357,6 +435,7 @@ function jump(status) {
   view = "incidents";
   classFilter = "unsafe";
   severityFilter = "any";
+  labelReview = null;
   statusFilter = status === "flagged" ? "any" : status;
   render();
 }
@@ -368,7 +447,7 @@ async function saveAssignment(form) {
   let status = form.status.value;
   if (!assignee) status = "unassigned";
   else if (status === "unassigned") status = "pending";
-  const res = await fetch("/assignments", {
+  const res = await fetch("assignments", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ event_id: e.id, assignee_id: assignee, status }),
@@ -379,7 +458,9 @@ async function saveAssignment(form) {
   }
   const data = await res.json();
   assignments[e.id] = data.assignment;
-  toast(assignee ? `Assigned to ${personName(assignee)}` : "Assignment cleared");
+  if (data.store) assignmentStore = data.store;
+  const where = assignmentStore === "vastdb" ? "Saved in VastDB" : "Saved on this server";
+  toast(assignee ? `${where} · ${personName(assignee)}` : "Assignment cleared");
   render();
 }
 
@@ -387,16 +468,20 @@ async function load(refresh) {
   viewEl.innerHTML = `<p class="empty">Loading incidents…</p>`;
   const q = refresh ? "?refresh=1" : "";
   const [evRes, teamRes, asRes] = await Promise.all([
-    fetch(`/events${q}`),
-    fetch("/team"),
-    fetch("/assignments"),
+    fetch(`events${q}`),
+    fetch("team"),
+    fetch("assignments"),
   ]);
   if (!evRes.ok) throw new Error("events");
   const ev = await evRes.json();
   events = (ev.events || []).map(prepare);
   meta = { source: ev.source, parcel_ready: ev.parcel_ready, sponsors: ev.sponsors || {} };
   if (teamRes.ok) people = (await teamRes.json()).people || [];
-  if (asRes.ok) assignments = (await asRes.json()).assignments || {};
+  if (asRes.ok) {
+    const asg = await asRes.json();
+    assignments = asg.assignments || {};
+    assignmentStore = asg.store || "file";
+  }
   render();
 }
 
@@ -412,13 +497,25 @@ document.body.addEventListener("click", (ev) => {
     view = "incidents";
     classFilter = "unsafe";
     statusFilter = "any";
+    labelReview = null;
     severityFilter = sev.dataset.severity;
     render();
     return;
   }
+  const review = ev.target.closest("[data-review]");
+  if (review) {
+    view = "incidents";
+    classFilter = "all";
+    statusFilter = "any";
+    severityFilter = "any";
+    labelReview = review.dataset.review;
+    render();
+    return;
+  }
   if (ev.target.closest("[data-severity-clear]")) { severityFilter = "any"; render(); return; }
+  if (ev.target.closest("[data-review-clear]")) { labelReview = null; render(); return; }
   const cls = ev.target.closest("[data-class]");
-  if (cls) { classFilter = cls.dataset.class; render(); return; }
+  if (cls) { classFilter = cls.dataset.class; labelReview = null; render(); return; }
   const st = ev.target.closest("[data-status]");
   if (st) { statusFilter = st.dataset.status; render(); return; }
   const open = ev.target.closest("[data-open]");
