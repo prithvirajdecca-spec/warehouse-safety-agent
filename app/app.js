@@ -8,10 +8,9 @@ const sideStatusEl = document.getElementById("side-status");
 const drawerEl = document.getElementById("drawer");
 
 const PERIODS = [
-  ["24h", "24 hours"],
-  ["7d", "7 days"],
-  ["30d", "30 days"],
-  ["90d", "90 days"],
+  ["1h", "last hour"],
+  ["24h", "last 24 hours"],
+  ["7d", "last 7 days"],
 ];
 const NAV = [
   ["dashboard", "Overview"],
@@ -52,7 +51,7 @@ let people = [];
 let assignments = {};
 let meta = { source: "", parcel_ready: false, sponsors: {} };
 let view = "dashboard";
-let period = "7d";
+let period = "1h";
 let classFilter = "unsafe";
 let statusFilter = "any";
 let severityFilter = "any";
@@ -85,13 +84,6 @@ function prepare(e) {
   return e;
 }
 
-function inPeriod(e) {
-  const t = Date.parse(e.flagged_at || "");
-  if (Number.isNaN(t)) return true;
-  const ms = period === "24h" ? 86400000 : { "7d": 7, "30d": 30, "90d": 90 }[period] * 86400000;
-  return t >= Date.now() - ms;
-}
-
 function recOf(e) {
   return assignments[e.id] || { status: "unassigned", assignee_id: null };
 }
@@ -118,7 +110,7 @@ function periodLabel() {
 }
 
 function flagged() {
-  return events.filter((e) => e.behavior_type === "unsafe" && inPeriod(e));
+  return events.filter((e) => e.behavior_type === "unsafe");
 }
 
 function statusLabel(status) {
@@ -130,7 +122,6 @@ function isWalkway(e) {
 }
 
 function matchesIncident(e) {
-  if (!inPeriod(e)) return false;
   if (labelReview && e.label_from_filename !== labelReview) return false;
   if (classFilter === "walkway_violation" && !isWalkway(e)) return false;
   else if (classFilter === "unsafe" && e.behavior_type !== "unsafe") return false;
@@ -141,15 +132,14 @@ function matchesIncident(e) {
 }
 
 function batchNote() {
-  const times = events.map((e) => Date.parse(e.flagged_at || "")).filter((t) => !Number.isNaN(t));
-  if (!times.length) return "";
-  const min = new Date(Math.min(...times));
-  const max = new Date(Math.max(...times));
-  const when = min.toLocaleDateString(undefined, { month: "short", day: "numeric" });
-  if (min.toDateString() === max.toDateString()) {
-    return `Indexed ${when}. The 24-hour, week, and month filters include this same batch.`;
+  return `Built from segments uploaded in the ${periodLabel()}. Older footage stays in the index and is left out of this search.`;
+}
+
+function emptyWindow() {
+  if (!events.length && period === "1h") {
+    return "No segments uploaded in the last hour. Switch to last 24 hours to see clips uploaded earlier today.";
   }
-  return `Indexed ${when} – ${max.toLocaleDateString(undefined, { month: "short", day: "numeric" })}.`;
+  return `No unsafe incidents in uploads from the ${periodLabel()}.`;
 }
 
 function renderSponsors() {
@@ -169,7 +159,7 @@ function renderChrome() {
     ([id, label]) => `<button type="button" data-period="${id}" class="${period === id ? "active" : ""}">${label}</button>`
   ).join("");
   const titles = {
-    dashboard: ["Overview", `Safety incidents flagged in the last ${periodLabel()}`],
+    dashboard: ["Overview", `Safety incidents from videos uploaded in the ${periodLabel()}`],
     incidents: ["Incidents", "Clip, caption, and owner for each flagged event"],
     investigations: ["Investigations", "Who is working which case"],
     team: ["Team", "Open caseload by investigator"],
@@ -191,9 +181,9 @@ function kpi(label, num, hint, status) {
 }
 
 function labelLine() {
-  const labeled = events.filter((e) => e.label_from_filename && inPeriod(e));
+  const labeled = events.filter((e) => e.label_from_filename);
   const agreed = labeled.filter((e) => e.label_match === true).length;
-  const conflicts = events.filter((e) => e.label_from_filename === "walkway_violation" && e.class_id !== "walkway_violation" && inPeriod(e));
+  const conflicts = events.filter((e) => e.label_from_filename === "walkway_violation" && e.class_id !== "walkway_violation");
   const agree = labeled.length ? `Ingest labels agree on ${agreed} of ${labeled.length} labeled clips.` : "";
   const review = conflicts.length
     ? `<button type="button" class="btn" data-review="walkway_violation">${conflicts.length} walkway clips: dataset says violation, Cosmos says on the path</button>`
@@ -214,12 +204,12 @@ function renderDashboard() {
   const recent = [...rows].sort((a, b) => Date.parse(b.flagged_at || 0) - Date.parse(a.flagged_at || 0)).slice(0, 8);
   viewEl.innerHTML = `
     <div class="kpis">
-      ${kpi("Flagged", rows.length, `Unsafe incidents · last ${periodLabel()}`, "flagged")}
+      ${kpi("Flagged", rows.length, `Unsafe incidents · ${periodLabel()}`, "flagged")}
       ${kpi("Needs assignment", count("unassigned"), "No investigator yet", "unassigned")}
       ${kpi("Under investigation", count("investigating"), "Owner is reviewing", "investigating")}
       ${kpi("Pending", count("pending"), "Assigned, not started", "pending")}
     </div>
-    <p class="muted" style="margin:0.7rem 0 0">Closed this period: ${count("closed")}. Flagged = needs assignment + pending + under investigation + closed. ${esc(batchNote())}</p>
+    <p class="muted" style="margin:0.7rem 0 0">Closed in this window: ${count("closed")}. Flagged = needs assignment + pending + under investigation + closed. ${esc(batchNote())}</p>
     ${labelLine()}
     <div class="grid-2">
       <section class="card">
@@ -253,7 +243,7 @@ function renderDashboard() {
             <td><span class="status ${esc(rec.status)}">${esc(statusLabel(rec.status))}</span></td>
           </tr>`;
         }).join("")}
-      </tbody></table>` : `<p class="empty">No unsafe incidents in this period.</p>`}
+      </tbody></table>` : `<p class="empty">${esc(emptyWindow())}</p>`}
     </section>`;
 }
 
@@ -320,7 +310,7 @@ function renderTeam() {
       ${mine.map((e) => `<div class="mini"><button type="button" data-open="${esc(e.id)}">
         <strong>${esc(e.class_label)}</strong>
         <div class="meta">${caseNo(e.id)} · ${esc(statusLabel(recOf(e).status))} · ${esc(e.severity)}</div>
-      </button></div>`).join("") || `<p class="empty">No open investigations in this period.</p>`}
+      </button></div>`).join("") || `<p class="empty">No open investigations in this upload window.</p>`}
     </section>`;
   }).join("") || `<p class="empty">Team list did not load.</p>`}</div>`;
 }
@@ -466,9 +456,10 @@ async function saveAssignment(form) {
 
 async function load(refresh) {
   viewEl.innerHTML = `<p class="empty">Loading incidents…</p>`;
-  const q = refresh ? "?refresh=1" : "";
+  const params = new URLSearchParams({ window: period });
+  if (refresh) params.set("refresh", "1");
   const [evRes, teamRes, asRes] = await Promise.all([
-    fetch(`events${q}`),
+    fetch(`events?${params}`),
     fetch("team"),
     fetch("assignments"),
   ]);
@@ -489,7 +480,12 @@ document.body.addEventListener("click", (ev) => {
   const nav = ev.target.closest("[data-nav]");
   if (nav) { view = nav.dataset.nav; render(); return; }
   const per = ev.target.closest("[data-period]");
-  if (per) { period = per.dataset.period; render(); return; }
+  if (per) {
+    if (per.dataset.period === period) return;
+    period = per.dataset.period;
+    load(true).catch(() => { viewEl.innerHTML = `<p class="empty">Could not load this upload window.</p>`; });
+    return;
+  }
   const jumpBtn = ev.target.closest("[data-jump]");
   if (jumpBtn) { jump(jumpBtn.dataset.jump); return; }
   const sev = ev.target.closest("[data-severity]");

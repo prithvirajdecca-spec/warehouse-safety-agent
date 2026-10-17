@@ -105,7 +105,7 @@ ASSIGN_STATUSES = {"unassigned", "pending", "investigating", "closed"}
 ASSIGN_PATH = Path(os.environ.get("ASSIGNMENTS_PATH", "/tmp/warehouse-safety-assignments.json"))
 
 _token = {"value": None, "exp": 0.0}
-_cache = {"events": None, "at": 0.0}
+_cache = {"by_window": {}}
 _lock = threading.Lock()
 _assign_lock = threading.Lock()
 
@@ -471,7 +471,10 @@ def _save_assignment_record(event_id: str, rec: dict) -> str:
     return store
 
 
-def fetch_vss_events() -> dict:
+UPLOAD_WINDOWS = {"1h", "24h", "7d"}
+
+
+def fetch_vss_events(time_filter: str = "1h") -> dict:
     if not (VSS_URL and VSS_USERNAME and VSS_PASSWORD):
         raise RuntimeError("VSS credentials not set")
     seen = set()
@@ -487,7 +490,7 @@ def fetch_vss_events() -> dict:
                 "top_k": 6,
                 "llm_top_n": 1,
                 "min_similarity": 0.18,
-                "time_filter": "all",
+                "time_filter": time_filter,
                 "include_public": True,
                 "metadata_filters": filters,
                 "tags": tags,
@@ -512,29 +515,34 @@ def fetch_vss_events() -> dict:
     return {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "source": "vss",
+        "time_filter": time_filter,
         "events": events,
         "parcel_ready": any(e["location"] == "parcel_demo" for e in events),
         "sponsors": {"vast": True, "cosmos": True, "wandb": wandb_any},
     }
 
 
-def load_events(force: bool = False) -> dict:
+def load_events(force: bool = False, time_filter: str = "1h") -> dict:
+    if time_filter not in UPLOAD_WINDOWS:
+        time_filter = "1h"
     if USE_SAMPLE:
         data = json.loads(SAMPLE.read_text())
         data["source"] = "sample"
+        data["time_filter"] = time_filter
         return data
     now = time.time()
     with _lock:
-        if not force and _cache["events"] and now - _cache["at"] < 45:
-            return _cache["events"]
+        slot = _cache["by_window"].get(time_filter)
+        if not force and slot and now - slot["at"] < 45:
+            return slot["events"]
         try:
-            data = fetch_vss_events()
+            data = fetch_vss_events(time_filter)
         except Exception as exc:
             data = json.loads(SAMPLE.read_text())
             data["source"] = "sample"
+            data["time_filter"] = time_filter
             data["error"] = str(exc)
-        _cache["events"] = data
-        _cache["at"] = now
+        _cache["by_window"][time_filter] = {"events": data, "at": now}
         return data
 
 
@@ -545,7 +553,11 @@ def health():
 
 @app.get("/events")
 def events():
-    data = dict(load_events(force=request.args.get("refresh") == "1"))
+    window = request.args.get("window") or "1h"
+    if window not in UPLOAD_WINDOWS:
+        window = "1h"
+    data = dict(load_events(force=request.args.get("refresh") == "1", time_filter=window))
+    data["time_filter"] = window
     data["events"] = [_decorate_event(dict(e)) for e in data.get("events") or []]
     return jsonify(data)
 
