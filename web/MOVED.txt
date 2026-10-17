@@ -1,0 +1,1 @@
+UI files live in ../app/ (index.html, styles.css, app.js) so deploy can ConfigMap one directory.

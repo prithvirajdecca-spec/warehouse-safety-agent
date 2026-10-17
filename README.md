@@ -1,36 +1,34 @@
 # Warehouse Safety Agent
 
-Hackathon app for team-9: an **unsafe-event queue** over VAST VSS (not a fork of `vss-blueprint`).
+Operator **unsafe queue** on team-9 VSS. Canonical code is the `app/` folder (flat, so it fits a K8s ConfigMap).
 
-Clips live in the shared team index (`eskisehir_plant`, `parcel_demo`). This repo is **code only** — no videos, no `/config` secrets.
+Clips stay in the shared index. Do not commit `.mp4`s or `/config` secrets.
 
-Open the deployed demo from [workshop.thecosmoslabs.com](https://workshop.thecosmoslabs.com) → **App** (`/app`).
+Deployed demo: [workshop.thecosmoslabs.com](https://workshop.thecosmoslabs.com) → **App**.
+
+## Run
+
+From `app/`:
+
+```bash
+pip install -r requirements.txt
+# live index (reads INGRESS_URL / USERNAME / PASSWORD / WANDB_* from the VM env)
+python main.py
+# or mock UI without VSS:
+USE_SAMPLE=1 python main.py
+```
+
+Open `http://127.0.0.1:8080`.
 
 ## Split
 
-| Person | Owns | Start here |
-|---|---|---|
-| A — agent / data | `api/` | Search VSS, classify, fill `/events` |
-| B — UI / demo | `web/` | Unsafe queue, player, class chips; mock from `events.sample.json` until A is live |
+| Person | Owns |
+|---|---|
+| A | `app/main.py` — VSS search, classify, `/events`, `/clip` |
+| B | `app/index.html` `styles.css` `app.js` — queue, player, chips |
 
-Agree the JSON in `CONTRACT.md` before changing field names.
+JSON shape: `CONTRACT.md`.
 
-## Local (Person B, no VSS)
+## 2-minute demo
 
-```bash
-cd api && pip install -r requirements.txt
-USE_SAMPLE=1 python main.py
-# open http://127.0.0.1:8080
-```
-
-## Sponsors to show in the 2-minute demo
-
-1. **VAST** — indexed clips + search
-2. **NVIDIA Cosmos** (CoreWeave) — captions / detections on the playing clip
-3. **Weights & Biases** — caption → class, severity, action
-
-## Do not
-
-- Commit `.mp4`s or team passwords
-- Push to `vast-data/vast-builders-challenge`
-- Redeploy `vss-blueprint`
+Unsafe tab → walkway clip (VAST + Cosmos caption) → forklift overload action → parcel if `parcel_demo` is indexed. Say **VAST, Cosmos, W&B** on screen.
