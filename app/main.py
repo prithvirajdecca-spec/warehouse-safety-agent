@@ -35,6 +35,10 @@ WANDB_API_KEY = os.environ.get("WANDB_API_KEY") or ""
 WANDB_TEAM = os.environ.get("WANDB_TEAM") or ""
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT") or ""
 WANDB_MODEL = os.environ.get("WANDB_MODEL") or "meta-llama/Llama-3.1-8B-Instruct"
+S3_ENDPOINT = os.environ.get("S3_ENDPOINT") or ""
+ACCESS_KEY = os.environ.get("ACCESS_KEY") or ""
+SECRET_KEY = os.environ.get("SECRET_KEY") or ""
+VASTDB_BUCKET = os.environ.get("VASTDB_BUCKET") or ""
 USE_SAMPLE = os.environ.get("USE_SAMPLE", "").lower() in ("1", "true", "yes")
 
 CLASS_META = {
@@ -82,12 +86,13 @@ Hard rules:
 """
 
 SEARCHES = [
-    ("OFF THE GREEN PATH person walking outside the marked walkway", {"location": "eskisehir_plant"}),
-    ("PANEL COVER OPEN on a machine", {"location": "eskisehir_plant"}),
-    ("worker at a machine panel not wearing a high-visibility vest", {"location": "eskisehir_plant"}),
-    ("forklift LOAD COUNT 3 or more stacked blocks overload", {"location": "eskisehir_plant"}),
-    ("forklift LOAD COUNT 2 stacked blocks on the green path", {"location": "eskisehir_plant"}),
-    ("person carrying or lifting a parcel", {"location": "parcel_demo"}),
+    ("person walking on or off the marked green path", {"location": "eskisehir_plant"}, ["walkway_violation"]),
+    ("OFF THE GREEN PATH person walking outside the marked walkway", {"location": "eskisehir_plant"}, []),
+    ("PANEL COVER OPEN on a machine", {"location": "eskisehir_plant"}, []),
+    ("worker at a machine panel not wearing a high-visibility vest", {"location": "eskisehir_plant"}, []),
+    ("forklift LOAD COUNT 3 or more stacked blocks overload", {"location": "eskisehir_plant"}, []),
+    ("forklift LOAD COUNT 2 stacked blocks on the green path", {"location": "eskisehir_plant"}, []),
+    ("person carrying or lifting a parcel", {"location": "parcel_demo"}, []),
 ]
 
 TEAM = [
@@ -127,16 +132,16 @@ def _headers() -> dict:
     return {"Authorization": f"Bearer {_login()}"}
 
 
-def _pack(cid: str, conf: float) -> tuple[str, str, str, str, str, float, bool]:
+def _pack(cid: str, conf: float, reason: str) -> tuple[str, str, str, str, str, float, str]:
     label, btype, sev, action = CLASS_META[cid]
-    return cid, label, btype, sev, action, conf, True
+    return cid, label, btype, sev, action, conf, reason
 
 
-def classify_rules(caption: str, location: str, tags) -> tuple[str, str, str, str, str, float, bool]:
+def classify_rules(caption: str, location: str, tags) -> tuple[str, str, str, str, str, float, str]:
     text = (caption or "").lower()
     tagset = {str(t).lower() for t in (tags or [])}
     if location == "parcel_demo" or "parcel" in tagset or "manual_handling" in tagset:
-        return _pack("parcel_handling", 0.78)
+        return _pack("parcel_handling", 0.78, "Clip is tagged as parcel handling")
 
     three_plus = bool(re.search(
         r"\b(three|four|five|[3-9])\b.{0,40}\b(block|pallet|load|container)s?\b"
@@ -182,24 +187,24 @@ def classify_rules(caption: str, location: str, tags) -> tuple[str, str, str, st
 
     # Most specific unsafe first — never let vest/walkway steal a counted overload.
     if three_plus and not two_or_fewer:
-        return _pack("forklift_overload", 0.88)
+        return _pack("forklift_overload", 0.88, "Rule: load count is 3 or more")
     if three_plus and ("exceeds" in text or "three" in text):
-        return _pack("forklift_overload", 0.84)
+        return _pack("forklift_overload", 0.84, "Rule: caption says the load exceeds the safe limit")
     if panel_open and not panel_closed:
-        return _pack("opened_panel_cover", 0.82)
+        return _pack("opened_panel_cover", 0.82, "Rule: caption says the panel cover is open")
     if forklift and two_or_fewer:
-        return _pack("safe_carrying", 0.86)
+        return _pack("safe_carrying", 0.86, "Rule: load count is 2 or fewer")
     if at_machine and no_vest and not has_vest:
-        return _pack("unauthorized_intervention", 0.76)
+        return _pack("unauthorized_intervention", 0.76, "Rule: working at a machine without a high-vis vest")
     if off_path and not on_path:
-        return _pack("walkway_violation", 0.84)
+        return _pack("walkway_violation", 0.84, "Rule: caption says off the green path")
     if at_machine and has_vest:
-        return _pack("authorized_intervention", 0.8)
+        return _pack("authorized_intervention", 0.8, "Rule: working at a machine with a high-vis vest")
     if panel_closed and at_machine:
-        return _pack("closed_panel_cover", 0.74)
+        return _pack("closed_panel_cover", 0.74, "Rule: panel cover is closed")
     if on_path:
-        return _pack("safe_walkway", 0.83)
-    return _pack("safe_walkway", 0.3)
+        return _pack("safe_walkway", 0.83, "Rule: caption says on the green path")
+    return _pack("safe_walkway", 0.3, "Rule: no stronger unsafe cue in the caption")
 
 
 def classify_wandb(caption: str) -> dict | None:
@@ -256,7 +261,8 @@ def hit_to_event(h: dict, allow_wandb: bool) -> dict:
     caption = h.get("reasoning_content") or ""
     loc = h.get("location") or ""
     tags = h.get("tags") or []
-    cid, label, btype, sev, action, conf, _ = classify_rules(caption, loc, tags)
+    cid, label, btype, sev, action, conf, reason = classify_rules(caption, loc, tags)
+    reason_source = "rule"
     wandb_used = False
     w = classify_wandb(caption) if allow_wandb else None
     # Strong caption rules win; W&B only fills weak / ambiguous cases.
@@ -267,6 +273,15 @@ def hit_to_event(h: dict, allow_wandb: bool) -> dict:
                 w["class_id"], w["class_label"], w["behavior_type"],
                 w["severity"], w["action"], w["confidence"],
             )
+            reason = "W&B classified the caption"
+            reason_source = "wandb"
+        elif w["class_id"] == cid:
+            reason = f"{reason} · W&B agrees"
+        else:
+            reason = f"{reason} · W&B said {w['class_label']}, rule kept"
+    file_label = next((t for t in tags if t in CLASS_META), None)
+    if file_label == "walkway_violation" and cid != "walkway_violation":
+        reason = "Dataset label is walkway violation. " + reason
     src = h.get("source") or ""
     return {
         "id": src or f"{loc}-{h.get('filename')}",
@@ -276,8 +291,10 @@ def hit_to_event(h: dict, allow_wandb: bool) -> dict:
         "severity": sev,
         "action": action,
         "confidence": round(conf, 2),
-        "label_from_filename": next((t for t in tags if t in CLASS_META), None),
+        "label_from_filename": file_label,
         "label_match": None,
+        "reason": reason,
+        "reason_source": reason_source,
         "location": loc,
         "camera_id": h.get("camera_id") or "",
         "caption": caption,
@@ -324,7 +341,10 @@ def _decorate_event(ev: dict) -> dict:
     return ev
 
 
-def _load_assignments() -> dict:
+ASSIGN_COLUMNS = None
+
+
+def _load_json_assignments() -> dict:
     if not ASSIGN_PATH.exists():
         return {}
     try:
@@ -334,9 +354,121 @@ def _load_assignments() -> dict:
     return data.get("assignments") or {}
 
 
-def _save_assignments(data: dict) -> None:
+def _save_json_assignments(data: dict) -> None:
     ASSIGN_PATH.parent.mkdir(parents=True, exist_ok=True)
     ASSIGN_PATH.write_text(json.dumps({"assignments": data}))
+
+
+def _vdb_ready() -> bool:
+    return bool(S3_ENDPOINT and ACCESS_KEY and SECRET_KEY and VASTDB_BUCKET)
+
+
+def _vdb_endpoint() -> str:
+    if S3_ENDPOINT.startswith(("http://", "https://")):
+        return S3_ENDPOINT
+    return f"http://{S3_ENDPOINT}"
+
+
+def _assignment_table(tx):
+    import pyarrow as pa
+
+    global ASSIGN_COLUMNS
+    if ASSIGN_COLUMNS is None:
+        ASSIGN_COLUMNS = pa.schema([
+            ("event_id", pa.utf8()),
+            ("assignee_id", pa.utf8()),
+            ("status", pa.utf8()),
+            ("updated_at", pa.utf8()),
+        ])
+    bucket = tx.bucket(VASTDB_BUCKET)
+    schema = bucket.schema("hackathon", fail_if_missing=False)
+    if schema is None:
+        schema = bucket.create_schema("hackathon", fail_if_exists=False)
+    table = schema.table("safety_assignments", fail_if_missing=False)
+    if table is None:
+        table = schema.create_table("safety_assignments", columns=ASSIGN_COLUMNS, fail_if_exists=False)
+    return table
+
+
+def _load_vdb_assignments() -> dict:
+    import vastdb
+
+    session = vastdb.connect(
+        endpoint=_vdb_endpoint(),
+        access=ACCESS_KEY,
+        secret=SECRET_KEY,
+        ssl_verify=False,
+    )
+    with session.transaction() as tx:
+        table = _assignment_table(tx)
+        latest: dict = {}
+        try:
+            reader = table.select(columns=["event_id", "assignee_id", "status", "updated_at"])
+            batches = list(reader)
+        except Exception:
+            batches = []
+        for batch in batches:
+            for row in batch.to_pylist():
+                eid = row.get("event_id") or ""
+                if not eid:
+                    continue
+                prev = latest.get(eid)
+                if prev and (prev.get("updated_at") or "") > (row.get("updated_at") or ""):
+                    continue
+                assignee = row.get("assignee_id") or None
+                latest[eid] = {
+                    "assignee_id": assignee or None,
+                    "status": row.get("status") or "unassigned",
+                    "updated_at": row.get("updated_at") or "",
+                }
+        return latest
+
+
+def _insert_vdb_assignment(event_id: str, rec: dict) -> None:
+    import pyarrow as pa
+    import vastdb
+
+    session = vastdb.connect(
+        endpoint=_vdb_endpoint(),
+        access=ACCESS_KEY,
+        secret=SECRET_KEY,
+        ssl_verify=False,
+    )
+    with session.transaction() as tx:
+        table = _assignment_table(tx)
+        arrow = pa.table(
+            {
+                "event_id": [event_id],
+                "assignee_id": [rec.get("assignee_id") or ""],
+                "status": [rec["status"]],
+                "updated_at": [rec["updated_at"]],
+            },
+            schema=ASSIGN_COLUMNS,
+        )
+        table.insert(arrow)
+
+
+def _load_assignments() -> tuple[dict, str]:
+    if _vdb_ready():
+        try:
+            return _load_vdb_assignments(), "vastdb"
+        except Exception:
+            pass
+    return _load_json_assignments(), "file"
+
+
+def _save_assignment_record(event_id: str, rec: dict) -> str:
+    store = "file"
+    if _vdb_ready():
+        try:
+            _insert_vdb_assignment(event_id, rec)
+            store = "vastdb"
+        except Exception:
+            store = "file"
+    current = _load_json_assignments()
+    current[event_id] = rec
+    _save_json_assignments(current)
+    return store
 
 
 def fetch_vss_events() -> dict:
@@ -346,7 +478,7 @@ def fetch_vss_events() -> dict:
     events = []
     wandb_any = False
     wandb_left = 5
-    for query, filters in SEARCHES:
+    for query, filters, tags in SEARCHES:
         r = requests.post(
             f"{VSS_URL.rstrip('/')}/api/v1/search",
             headers={**_headers(), "Content-Type": "application/json"},
@@ -358,6 +490,7 @@ def fetch_vss_events() -> dict:
                 "time_filter": "all",
                 "include_public": True,
                 "metadata_filters": filters,
+                "tags": tags,
             },
             timeout=60,
         )
@@ -425,7 +558,8 @@ def team():
 @app.get("/assignments")
 def assignments():
     with _assign_lock:
-        return jsonify(assignments=_load_assignments())
+        rows, store = _load_assignments()
+        return jsonify(assignments=rows, store=store)
 
 
 @app.post("/assignments")
@@ -453,10 +587,61 @@ def save_assignment():
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     with _assign_lock:
-        data = _load_assignments()
-        data[event_id] = rec
-        _save_assignments(data)
-    return jsonify(assignment=rec)
+        store = _save_assignment_record(event_id, rec)
+    return jsonify(assignment=rec, store=store)
+
+
+@app.get("/detections")
+def detections():
+    source = request.args.get("source") or ""
+    if not source.startswith("s3://"):
+        return jsonify(error="source required"), 400
+    try:
+        r = requests.get(
+            f"{VSS_URL.rstrip('/')}/api/v1/videos/detections",
+            params={"source": source},
+            headers=_headers(),
+            timeout=30,
+        )
+    except requests.RequestException:
+        return jsonify(width=0, height=0, frames=[])
+    if r.status_code == 404:
+        return jsonify(width=0, height=0, frames=[])
+    if r.status_code >= 400:
+        return jsonify(width=0, height=0, frames=[])
+    data = r.json()
+    shape = data.get("video_shape") or [0, 0]
+    height = int(shape[0]) if shape else 0
+    width = int(shape[1]) if len(shape) > 1 else 0
+    keep = {"person", "truck", "forklift", "suitcase"}
+    frames = []
+    for fr in data.get("frames") or []:
+        boxes = []
+        for det in fr.get("detections") or []:
+            label = str(det.get("label") or "")
+            if label not in keep:
+                continue
+            conf = float(det.get("confidence") or 0)
+            if conf < 0.4:
+                continue
+            box = det.get("bbox") or []
+            if len(box) != 4:
+                continue
+            x1, y1, x2, y2 = box
+            boxes.append({
+                "label": label,
+                "conf": round(conf, 2),
+                "x": x1,
+                "y": y1,
+                "w": max(0, x2 - x1),
+                "h": max(0, y2 - y1),
+            })
+        if boxes:
+            frames.append({"t": fr.get("time_sec") or 0, "boxes": boxes})
+    if len(frames) > 12:
+        step = len(frames) / 12
+        frames = [frames[int(i * step)] for i in range(12)]
+    return jsonify(width=width, height=height, frames=frames)
 
 
 @app.get("/clip")
