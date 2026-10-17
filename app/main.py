@@ -42,9 +42,9 @@ CLASS_META = {
                           "Stop and coach: return to the marked green path"),
     "unauthorized_intervention": ("Unauthorized intervention", "unsafe", "high",
                                   "Stop work until a high-vis authorized vest is worn"),
-    "opened_panel_cover": ("Opened panel cover", "unsafe", "high",
+    "opened_panel_cover": ("Opened panel cover", "unsafe", "severe",
                            "Close the panel cover before leaving the machine"),
-    "forklift_overload": ("Forklift overload", "unsafe", "high",
+    "forklift_overload": ("Forklift overload", "unsafe", "severe",
                           "Stop forklift until the load is 2 blocks or fewer"),
     "parcel_handling": ("Parcel handling", "unsafe", "medium",
                         "Coach: bend knees, keep the load close, two-handed grip"),
@@ -90,9 +90,19 @@ SEARCHES = [
     ("person carrying or lifting a parcel", {"location": "parcel_demo"}),
 ]
 
+TEAM = [
+    {"id": "rivera", "name": "Alex Rivera", "role": "Shift supervisor", "shift": "Days"},
+    {"id": "okonkwo", "name": "Sam Okonkwo", "role": "Safety investigator", "shift": "Days"},
+    {"id": "chen", "name": "Jordan Chen", "role": "Safety investigator", "shift": "Nights"},
+    {"id": "shah", "name": "Priya Shah", "role": "Floor lead", "shift": "Days"},
+]
+ASSIGN_STATUSES = {"unassigned", "pending", "investigating", "closed"}
+ASSIGN_PATH = Path(os.environ.get("ASSIGNMENTS_PATH", "/tmp/warehouse-safety-assignments.json"))
+
 _token = {"value": None, "exp": 0.0}
 _cache = {"events": None, "at": 0.0}
 _lock = threading.Lock()
+_assign_lock = threading.Lock()
 
 app = Flask(__name__, static_folder=str(HERE), static_url_path="")
 
@@ -276,8 +286,57 @@ def hit_to_event(h: dict, allow_wandb: bool) -> dict:
         "start_sec": h.get("start_time") or h.get("segment_start_sec") or 0,
         "end_sec": h.get("end_time") or h.get("segment_end_sec") or 0,
         "similarity": h.get("similarity_score"),
+        "flagged_at": _flagged_at(h, src),
         "sponsors": {"vast": True, "cosmos": True, "wandb": wandb_used},
     }
+
+
+def _flagged_at_from_source(src: str) -> str | None:
+    m = re.search(r"(20\d{6})_(\d{6})", src or "")
+    if not m:
+        return None
+    d, t = m.group(1), m.group(2)
+    return f"{d[:4]}-{d[4:6]}-{d[6:8]}T{t[:2]}:{t[2:4]}:{t[4:6]}Z"
+
+
+def _flagged_at(h: dict, src: str) -> str | None:
+    for key in ("created_at", "indexed_at", "timestamp", "upload_time"):
+        val = h.get(key)
+        if isinstance(val, str) and val:
+            return val
+    return (
+        _flagged_at_from_source(src)
+        or _flagged_at_from_source(h.get("filename") or "")
+        or _flagged_at_from_source(h.get("original_video") or "")
+    )
+
+
+def _decorate_event(ev: dict) -> dict:
+    meta = CLASS_META.get(ev.get("class_id") or "")
+    if meta:
+        ev["class_label"], ev["behavior_type"], ev["severity"], ev["action"] = meta
+    if not ev.get("flagged_at"):
+        ev["flagged_at"] = (
+            _flagged_at_from_source(ev.get("source") or "")
+            or _flagged_at_from_source(ev.get("original_video") or "")
+            or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        )
+    return ev
+
+
+def _load_assignments() -> dict:
+    if not ASSIGN_PATH.exists():
+        return {}
+    try:
+        data = json.loads(ASSIGN_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data.get("assignments") or {}
+
+
+def _save_assignments(data: dict) -> None:
+    ASSIGN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ASSIGN_PATH.write_text(json.dumps({"assignments": data}))
 
 
 def fetch_vss_events() -> dict:
@@ -353,7 +412,51 @@ def health():
 
 @app.get("/events")
 def events():
-    return jsonify(load_events(force=request.args.get("refresh") == "1"))
+    data = dict(load_events(force=request.args.get("refresh") == "1"))
+    data["events"] = [_decorate_event(dict(e)) for e in data.get("events") or []]
+    return jsonify(data)
+
+
+@app.get("/team")
+def team():
+    return jsonify(people=TEAM)
+
+
+@app.get("/assignments")
+def assignments():
+    with _assign_lock:
+        return jsonify(assignments=_load_assignments())
+
+
+@app.post("/assignments")
+def save_assignment():
+    body = request.get_json(force=True, silent=True) or {}
+    event_id = str(body.get("event_id") or "").strip()
+    if not event_id:
+        return jsonify(error="event_id required"), 400
+    assignee = body.get("assignee_id") or None
+    if assignee == "":
+        assignee = None
+    status = str(body.get("status") or "unassigned")
+    known = {p["id"] for p in TEAM}
+    if assignee and assignee not in known:
+        return jsonify(error="unknown assignee"), 400
+    if status not in ASSIGN_STATUSES:
+        return jsonify(error="unknown status"), 400
+    if status == "unassigned":
+        assignee = None
+    elif not assignee:
+        return jsonify(error="assignee required"), 400
+    rec = {
+        "assignee_id": assignee,
+        "status": status,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    with _assign_lock:
+        data = _load_assignments()
+        data[event_id] = rec
+        _save_assignments(data)
+    return jsonify(assignment=rec)
 
 
 @app.get("/clip")
@@ -379,6 +482,14 @@ def clip():
         if k.lower() in ("content-type", "content-length", "content-range", "accept-ranges")
     }
     return Response(r.iter_content(64 * 1024), status=r.status_code, headers=headers)
+
+
+@app.after_request
+def _no_store(resp):
+    path = request.path
+    if path == "/" or path.endswith((".js", ".css", ".html")):
+        resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.get("/")

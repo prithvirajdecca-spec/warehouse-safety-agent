@@ -11,7 +11,7 @@ Forklift load:
 - Safe carrying is N <= 2. Overload is N >= 3.
 
 Panel:
-- If a machine/electrical panel cover is open, write "PANEL COVER OPEN".
+- If a machine/electrical panel cover is open and there is no person close to the panel, write "PANEL COVER OPEN".
 - If it is closed, write "PANEL COVER CLOSED".
 - A nearby control panel that is not an open cover is not PANEL COVER OPEN.
 
