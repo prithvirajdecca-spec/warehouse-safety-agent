@@ -3,25 +3,41 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Warehouse Safety Queue</title>
+  <title>Plant safety operations</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <header>
-    <div>
-      <h1>Unsafe queue</h1>
-      <p class="sub">Supervisor view — clip + caption + action. Not a search box.</p>
-    </div>
-    <div class="sponsors" id="sponsors"></div>
-  </header>
-  <nav id="chips"></nav>
-  <p class="banner" id="banner"></p>
-  <main>
-    <section id="list"></section>
-    <aside id="detail">
-      <p class="empty">Select an event</p>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="mark">PS</span>
+        <div>
+          <strong>Plant safety</strong>
+          <span>Eskisehir operations</span>
+        </div>
+      </div>
+      <nav id="nav"></nav>
+      <div class="side-foot">
+        <div class="sponsors" id="sponsors"></div>
+        <p id="side-status"></p>
+      </div>
     </aside>
-  </main>
+    <div class="workspace">
+      <header class="topbar">
+        <div>
+          <h1 id="view-title">Overview</h1>
+          <p class="sub" id="view-sub"></p>
+        </div>
+        <div class="top-actions">
+          <div class="period" id="period"></div>
+          <button type="button" id="refresh" class="btn">Refresh</button>
+        </div>
+      </header>
+      <div id="view"></div>
+    </div>
+  </div>
+  <div id="drawer" class="drawer" hidden></div>
+  <div id="toast" class="toast" hidden></div>
   <script src="app.js"></script>
 </body>
 </html>
